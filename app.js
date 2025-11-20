@@ -169,6 +169,9 @@ class MQTTConnection {
         this.headerBuffer = Buffer.alloc(16);
         this.mcpPendingRequests = {};
 
+        // 提取真实的客户端IP
+        this.realClientIp = socket.remoteAddress;
+
         // 创建协议处理器，并传入socket
         this.protocol = new MQTTProtocol(socket, configManager);
 
@@ -225,7 +228,7 @@ class MQTTConnection {
 
         const parts = this.clientId.split('@@@');
         if (parts.length === 3) { // GID_test@@@mac_address@@@uuid
-            const validated = validateMqttCredentials(this.clientId, this.username, this.password);
+            const validated = validateMqttCredentials(this.clientId, this.username, this.password, this.realClientIp);
             this.groupId = validated.groupId;
             this.macAddress = validated.macAddress;
             this.uuid = validated.uuid;

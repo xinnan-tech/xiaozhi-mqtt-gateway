@@ -18,7 +18,7 @@ function generatePasswordSignature(content, secretKey) {
     return base64Signature;
 }
 
-function validateMqttCredentials(clientId, username, password) {
+function validateMqttCredentials(clientId, username, password, realClientIp = null) {
     // 验证密码签名
     const signatureKey = process.env.MQTT_SIGNATURE_KEY;
     if (signatureKey) {
@@ -34,19 +34,19 @@ function validateMqttCredentials(clientId, username, password) {
     if (!clientId || typeof clientId !== 'string') {
         throw new Error('clientId必须是非空字符串');
     }
-    
+
     // 验证clientId格式（必须包含@@@分隔符）
     const clientIdParts = clientId.split('@@@');
     // 新版本 MQTT 参数
     if (clientIdParts.length !== 3) {
         throw new Error('clientId格式错误，必须包含@@@分隔符');
     }
-    
+
     // 验证username
     if (!username || typeof username !== 'string') {
         throw new Error('username必须是非空字符串');
     }
-    
+
     // 尝试解码username（应该是base64编码的JSON）
     let userData;
     try {
@@ -55,12 +55,19 @@ function validateMqttCredentials(clientId, username, password) {
     } catch (error) {
         throw new Error('username不是有效的base64编码JSON');
     }
-    
+
+    // 如果有真实IP，使用真实IP覆盖客户端提供的IP
+    if (realClientIp) {
+        // 处理IPv6映射的IPv4地址 (::ffff:192.168.1.1 -> 192.168.1.1)
+        const cleanIp = realClientIp.replace(/^::ffff:/, '');
+        userData.ip = cleanIp;
+    }
+
     // 解析clientId中的信息
     const [groupId, macAddress, uuid] = clientIdParts;
-    
+
     // 如果验证成功，返回解析后的有用信息
-    return { 
+    return {
         groupId,
         macAddress: macAddress.replace(/_/g, ':'),
         uuid,
