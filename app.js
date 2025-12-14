@@ -59,10 +59,33 @@ class WebSocketBridge extends Emitter {
 
     async connect(audio_params, features) {
         return new Promise((resolve, reject) => {
+            // 生成WebSocket认证token
+            let authorization = "test-token";
+            const serverSecret = process.env.SERVER_SECRET;
+            if (serverSecret) {
+                const clientId = this.uuid || 'default-client-id';
+                const username = this.macAddress;
+                const timestamp = Math.floor(Date.now() / 1000);
+
+                // 构建签名内容: clientId|username|timestamp
+                const content = `${clientId}|${username}|${timestamp}`;
+
+                // 生成HMAC-SHA256签名
+                const hmac = crypto.createHmac('sha256', serverSecret);
+                hmac.update(content);
+                const signature = hmac.digest();
+
+                // Base64 URL-safe编码签名(去除填充符=)
+                const signatureBase64 = signature.toString('base64url');
+
+                // 生成认证token: signature.timestamp
+                authorization = `${signatureBase64}.${timestamp}`;
+            }
+
             const headers = {
                 'device-id': this.macAddress,
                 'protocol-version': '2',
-                'authorization': `Bearer test-token`
+                'authorization': `Bearer ${authorization}`
             };
             if (this.uuid) {
                 headers['client-id'] = this.uuid;
