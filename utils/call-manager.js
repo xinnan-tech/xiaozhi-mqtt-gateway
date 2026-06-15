@@ -8,6 +8,8 @@ class CallManager {
         this.pendingCalls = new Map();
         // mac => targetMac (双向映射)
         this.activeCalls = new Map();
+        // mac => session_id (通话模式使用的session_id，用于goodbye时发送给对端)
+        this.callSessionIds = new Map();
         this.getConnectionByMac = null;  // (mac) => MQTTConnection
     }
 
@@ -37,7 +39,7 @@ class CallManager {
             this.activeCalls.set(callerMac, targetMac);
             this.activeCalls.set(targetMac, callerMac);
             console.log(`通话已建立: ${callerMac} <-> ${targetMac}`);
-            return { status: 'bridged' };
+            return { status: 'bridged', peerMac: targetMac };
         }
 
         // 单方面请求，需要远程唤醒对方
@@ -54,18 +56,26 @@ class CallManager {
     /**
      * 处理被叫方加入通话
      * @param {string} calleeMac - 被叫方MAC（说"接听"的一方）
-     * @returns {{status: 'bridged' | 'no_pending' | 'caller_gone' | 'error', message?: string}}
+     * @returns {{status: 'bridged' | 'no_pending' | 'caller_gone' | 'error', message?: string, peerMac?: string}}
      */
     joinCall(calleeMac) {
         calleeMac = calleeMac.toLowerCase();
 
-        // 检查是否有等待该设备加入的通话
-        const pendingEntry = this.pendingCalls.get(calleeMac);
+        // 查找等待该设备加入的通话（pendingEntry.targetMac === calleeMac）
+        let pendingEntry = null;
+        let callerMac = null;
+        for (const [mac, entry] of this.pendingCalls) {
+            if (entry.targetMac === calleeMac) {
+                callerMac = mac;
+                pendingEntry = entry;
+                break;
+            }
+        }
+
         if (!pendingEntry) {
             return { status: 'no_pending', message: '没有等待中的通话' };
         }
 
-        const callerMac = pendingEntry.targetMac;
         // 检查主叫方是否还在pending状态
         const callerPending = this.pendingCalls.get(callerMac);
         if (!callerPending || callerPending.targetMac !== calleeMac) {
@@ -78,7 +88,7 @@ class CallManager {
         this.activeCalls.set(callerMac, calleeMac);
         this.activeCalls.set(calleeMac, callerMac);
         console.log(`通话已建立: ${callerMac} <-> ${calleeMac}`);
-        return { status: 'bridged' };
+        return { status: 'bridged', peerMac: callerMac };
     }
 
     /**
@@ -99,8 +109,22 @@ class CallManager {
     }
 
     /**
+     * 设置通话模式使用的session_id
+     */
+    setCallSessionId(mac, sessionId) {
+        this.callSessionIds.set(mac?.toLowerCase(), sessionId);
+    }
+
+    /**
+     * 获取通话模式使用的session_id
+     */
+    getCallSessionId(mac) {
+        return this.callSessionIds.get(mac?.toLowerCase());
+    }
+
+    /**
      * 清除设备通话状态
-     * @returns {{ pendingCleared: boolean, peerMac: string|null, fromPending: boolean }}
+     * @returns {{ pendingCleared: boolean, peerMac: string|null, fromPending: boolean, sessionId?: string }}
      * 返回被清除的通话对方信息
      */
     clearDevice(mac) {
@@ -110,7 +134,9 @@ class CallManager {
         const pendingEntry = this.pendingCalls.get(lowerMac);
         if (pendingEntry) {
             this.pendingCalls.delete(lowerMac);
-            return { pendingCleared: true, peerMac: pendingEntry.targetMac, fromPending: true };
+            const sessionId = this.callSessionIds.get(lowerMac);
+            this.callSessionIds.delete(lowerMac);
+            return { pendingCleared: true, peerMac: pendingEntry.targetMac, fromPending: true, sessionId };
         }
 
         // 检查是否在 activeCalls 中
@@ -118,10 +144,12 @@ class CallManager {
         if (peerMac) {
             this.activeCalls.delete(lowerMac);
             this.activeCalls.delete(peerMac);
-            return { pendingCleared: false, peerMac, fromPending: false };
+            const sessionId = this.callSessionIds.get(lowerMac);
+            this.callSessionIds.delete(lowerMac);
+            return { pendingCleared: false, peerMac, fromPending: false, sessionId };
         }
 
-        return { pendingCleared: false, peerMac: null, fromPending: false };
+        return { pendingCleared: false, peerMac: null, fromPending: false, sessionId: null };
     }
 
     /**

@@ -304,9 +304,11 @@ class MQTTConnection {
         // 清理设备通话状态
         if (this.macAddress) {
             const peerConn = this.server.callManager.getPeerConnection(this.macAddress);
+            // 必须先获取session_id，再调用clearDevice（因为clearDevice会删除callSessionIds）
+            const peerSessionId = peerConn ? this.server.callManager.getCallSessionId(peerConn.macAddress) : null;
             this.server.callManager.clearDevice(this.macAddress);
-            if (peerConn) {
-                peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', reason: '对方已离开' }));
+            if (peerConn && peerSessionId) {
+                peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: peerSessionId, reason: '对方已离开' }));
             }
         }
 
@@ -429,12 +431,15 @@ class MQTTConnection {
             console.log(`通话开始: ${this.clientId} Protocol: ${json.version} ${this.bridge.chatServer}`);
 
             // 设备重新连接AI服务端，清理之前的通话状态
+            // 必须先获取通话session_id，再调用clearDevice（因为clearDevice会删除session_id）
+            const callSessionId = this.server.callManager.getCallSessionId(this.macAddress);
             const clearResult = this.server.callManager.clearDevice(this.macAddress);
             if (clearResult.peerMac) {
                 const peerConn = this.server.getConnectionByMac(clearResult.peerMac);
                 if (peerConn) {
-                    peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye' }));
-                    console.log(`通话状态已清理，已通知对方 ${clearResult.peerMac} 发送 goodbye`);
+                    const goodbyeSessionId = callSessionId || this.udp.session_id;
+                    peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: goodbyeSessionId }));
+                    console.log(`通话状态已清理，已通知对方 ${clearResult.peerMac} 发送 goodbye, session=${goodbyeSessionId}`);
                 }
             }
 
@@ -753,7 +758,7 @@ class MQTTServer {
             for (const { mac, peerMac } of cleanedCalls) {
                 const conn = this.getConnectionByMac(mac);
                 if (conn) {
-                    conn.sendMqttMessage(JSON.stringify({ type: 'goodbye' }));
+                    conn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: conn.udp.session_id }));
                     console.log(`已发送超时goodbye给 ${mac}`);
                 }
             }
@@ -799,11 +804,12 @@ class MQTTServer {
         // 清理设备通话状态并通知对方
         if (connection.macAddress) {
             const peerConn = this.callManager.getPeerConnection(connection.macAddress);
+            // 必须先获取session_id，再调用clearDevice（因为clearDevice会删除callSessionIds）
+            const peerSessionId = peerConn ? this.callManager.getCallSessionId(peerConn.macAddress) : null;
             this.callManager.clearDevice(connection.macAddress);
-            // 通知对方通话结束
-            if (peerConn) {
-                peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye'}));
-                peerConn.close();
+            // 通知对方通话结束（使用对端的session_id）
+            if (peerConn && peerSessionId) {
+                peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: peerSessionId }));
             }
         }
 
@@ -1076,10 +1082,24 @@ app.post('/api/call/request', authenticateRequest, (req, res) => {
         // 通话请求成功，断开设备的 bridge，让设备进入通话模式
         if (result.status === 'bridged' || result.status === 'pending') {
             const callerConn = server.getConnectionByMac(caller_mac);
+            // 必须在断开bridge前记录session_id，因为断开后device会进入通话模式，session_id会变化
+            const callerSessionId = callerConn?.udp?.session_id;
             if (callerConn?.bridge) {
                 callerConn.bridge.close();
                 callerConn.bridge = null;
                 console.log(`通话请求成功，已断开设备 ${caller_mac} 的 bridge`);
+            }
+            // 记录主叫方进入通话模式前的session_id（bridge模式的session）
+            if (callerSessionId) {
+                server.callManager.setCallSessionId(caller_mac, callerSessionId);
+            }
+        }
+
+        // 如果是双向匹配建立桥接，被叫方也已经进入了通话模式，需要记录被叫方的session_id
+        if (result.status === 'bridged' && result.peerMac) {
+            const targetConn = server.getConnectionByMac(target_mac);
+            if (targetConn?.udp?.session_id) {
+                server.callManager.setCallSessionId(target_mac, targetConn.udp.session_id);
             }
         }
 
@@ -1110,6 +1130,52 @@ app.post('/api/call/request', authenticateRequest, (req, res) => {
         });
     } catch (error) {
         console.error('处理通话请求错误:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// 接听通话请求（被叫方调用）
+app.post('/api/call/accept', authenticateRequest, (req, res) => {
+    try {
+        const { mac } = req.body;
+
+        if (!mac) {
+            return res.status(400).json({ error: '缺少必要参数: mac' });
+        }
+
+        const result = server.callManager.joinCall(mac);
+
+        if (result.status === 'bridged') {
+            // 获取对方的连接并通知对方通话已建立
+            const peerMac = result.peerMac;
+            const peerConn = server.getConnectionByMac(peerMac);
+            if (peerConn) {
+                peerConn.sendMqttMessage(JSON.stringify({ type: 'call_accepted', from: mac }));
+            }
+            // 断开设备的 bridge，让设备进入通话模式
+            const calleeConn = server.getConnectionByMac(mac);
+            // 必须在断开bridge前记录session_id，因为断开后device会进入通话模式，session_id会变化
+            const calleeSessionId = calleeConn?.udp?.session_id;
+            const peerSessionId = peerConn?.udp?.session_id;
+            if (calleeConn?.bridge) {
+                calleeConn.bridge.close();
+                calleeConn.bridge = null;
+                console.log(`通话接听成功，已断开设备 ${mac} 的 bridge`);
+            }
+            console.log(`通话已建立: ${mac} <-> ${peerMac}`);
+
+            // 记录进入通话模式前的session_id（bridge模式的session）
+            if (calleeSessionId) {
+                server.callManager.setCallSessionId(mac, calleeSessionId);
+            }
+            if (peerSessionId) {
+                server.callManager.setCallSessionId(peerMac, peerSessionId);
+            }
+        }
+
+        res.json(result);
+    } catch (error) {
+        console.error('处理接听请求错误:', error);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
