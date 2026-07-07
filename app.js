@@ -15,6 +15,43 @@ const { ConfigManager } = require('./utils/config-manager');
 const { CallManager } = require('./utils/call-manager');
 const { validateMqttCredentials } = require('./utils/mqtt_config_v2');
 
+// libopus-wasm 编码器缓存（用于生成静音帧）
+let opusEncoderPromise = null;
+let opusEncoder = null;
+let cachedSilenceFrame = null;  // 预编码的静音帧，启动时生成
+
+async function warmupOpusEncoder() {
+    const encoder = await getOpusEncoder();
+    // 预编码一个静音帧缓存起来，发送时直接用
+    const silentPCM = new Int16Array(960);
+    const encoded = encoder.encode(silentPCM, { frameSize: 960 });
+    cachedSilenceFrame = Buffer.from(encoded);
+    console.log(`OPUS encoder warmed up, silence frame size: ${cachedSilenceFrame.length}`);
+}
+
+function getOpusEncoder() {
+    if (opusEncoder) return Promise.resolve(opusEncoder);
+    if (!opusEncoderPromise) {
+        opusEncoderPromise = (async () => {
+            const libopus = await import('libopus-wasm');
+            opusEncoder = await libopus.createEncoder({
+                channels: 1,
+                sampleRate: 16000,
+                frameSize: 960,  // 60ms at 16kHz = 960 samples
+            });
+            return opusEncoder;
+        })();
+    }
+    return opusEncoderPromise;
+}
+
+function generateOpusSilenceFrame() {
+    return cachedSilenceFrame;
+}
+
+// 确保编码器已初始化（启动时调用一次）
+warmupOpusEncoder().catch(e => console.error('OPUS encoder init failed:', e));
+
 
 function setDebugEnabled(enabled) {
     if (enabled) {
@@ -517,7 +554,15 @@ class MQTTConnection {
 
                 // 发送给通话对方或 pending 回声（发给自己）
                 const targetConn = (peerConn && peerConn.udp?.key && peerConn.udp?.remoteAddress) ? peerConn : this;
-                this.sendUdpEncrypted(targetConn, payload);
+                if (targetConn === this) {
+                    // pending 回声：发送OPUS静音帧
+                    const silentPayload = generateOpusSilenceFrame();
+                    if (silentPayload) {
+                        this.sendUdpEncrypted(targetConn, silentPayload);
+                    }
+                } else {
+                    this.sendUdpEncrypted(targetConn, payload);
+                }
                 return;
             } catch (e) {
                 console.error(`通话处理失败: ${e.message}`);
@@ -530,43 +575,21 @@ class MQTTConnection {
         }
         if (this.udp.remoteAddress !== rinfo) {
             this.udp.remoteAddress = rinfo;
-            // 初始化音频时间戳基准
-            this.udp.audioStartTime = Date.now();
-            this.udp.audioSequenceStart = sequence;
-            this.udp.remoteSequence = sequence - 1; // 设置为当前序列号-1，这样下次检查会通过
         }
         if (sequence < this.udp.remoteSequence) {
             return;
         }
-        if (sequence !== this.udp.remoteSequence + 1) {
-            console.warn(`Received audio packet with wrong sequence: ${sequence}, expected: ${this.udp.remoteSequence + 1}`, {
-                remoteAddress: rinfo.address,
-                remotePort: rinfo.port,
-                clientId: this.clientId
-            });
-        }
-
-        // 由于设备发送的时间戳为0，我们根据序列号生成时间戳
-        // 假设每个音频包60ms (Opus帧时长)，使用32位时间戳
-        const frameMs = 60;
-        const relativeTimeMs = (sequence - this.udp.audioSequenceStart) * frameMs;
-        // 使用相对时间戳，避免超出32位范围
-        const correctedTimestamp = (relativeTimeMs) % (2 ** 32);
-
-        console.log(`收到UDP音频数据从 ${this.clientId}, 长度: ${payloadLength}, 原时间戳: ${timestamp}, 修正时间戳: ${correctedTimestamp}, 序列号: ${sequence}`);
 
         // 处理加密数据
         const header = message.slice(0, 16);
         const encryptedPayload = message.slice(16, 16 + payloadLength);
 
-        // 添加解密错误处理
         try {
             const cipher = crypto.createDecipheriv(this.udp.encryption, this.udp.key, header);
             const payload = Buffer.concat([cipher.update(encryptedPayload), cipher.final()]);
 
-            console.log(`UDP音频解密成功，转发到WebSocket，opus长度: ${payload.length}`);
-            // 使用修正后的时间戳
-            this.bridge.sendAudio(payload, correctedTimestamp);
+            console.log(`收到UDP音频数据从${this.clientId}转发到WebSocket，长度: ${payload.length}, 时间戳: ${timestamp}, 序列号: ${sequence}`);
+            this.bridge.sendAudio(payload, timestamp);
             this.udp.remoteSequence = sequence;
         } catch (decryptionError) {
             console.error(`UDP 解密失败: ${decryptionError.message}`, {
@@ -582,7 +605,7 @@ class MQTTConnection {
 
     // 加密并发送 UDP 消息（targetConn 为对方连接时发给对方，为 this 时发给自己）
     sendUdpEncrypted(targetConn, payload) {
-        const seq = targetConn.udp.localSequence++;
+        const seq = ++targetConn.udp.localSequence;
         targetConn.headerBuffer.writeUInt8(1, 0);
         targetConn.headerBuffer.writeUInt8(0, 1);
         targetConn.headerBuffer.writeUInt16BE(payload.length, 2);
